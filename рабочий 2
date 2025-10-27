@@ -1,0 +1,288 @@
+/**
+ * Слепки статусов v1.1.0 — сортировка как в источнике
+ *
+ * Источник: лист "Ниши 2.0"
+ * Снимки (слепки): лист "Слепки"
+ *
+ * Изменения:
+ * - Сортировка строк листа "Слепки" теперь повторяет порядок ID в листе "Ниши 2.0".
+ * - ID, которых нет в источнике, остаются и перемещаются в самый низ.
+ * - Все исторические колонки-слепки сохраняются, так как сортируются целые строки.
+ *
+ * Тред ChatGPT:
+ * https://chatgpt.com/g/g-p-6846f7c926348191b3ff0ea16ca0ad2b/c/68f67726-b9c4-832f-81c6-c658d0826323
+ */
+
+const CFG = {
+  SOURCE_SHEET: 'Ниши 2.0',
+  SNAPSHOT_SHEET: 'Слепки',
+  COLS: {
+    ID: 1,   // A
+    B: 2,    // B
+    D: 4,    // D
+    E: 5,    // E
+    F: 6,    // F
+    H: 8,    // H
+    I: 9,    // I
+    Q: 17,   // Q
+    STATUS: 7 // G
+  },
+  OUTPUT_HEADERS: ['ID','B','D','E','F','H','I','Q','Текущий статус'],
+  ALLOWED_STATUSES: new Set([
+    '0. Текст пишется',
+    '2. Размещай',
+    '3. Размещаю',
+    '4. Размещено, проверяй не в индексе'
+  ]),
+  TIMEZONE: 'Europe/Warsaw',
+  PROP_STORE: PropertiesService.getScriptProperties(),
+  PROP_LAST_RUN_DATE: 'last_run_yymmdd'
+};
+
+/** Ручной ПЕРВЫЙ запуск. */
+function setupFirstRun() {
+  const ss = SpreadsheetApp.getActive();
+  const src = ss.getSheetByName(CFG.SOURCE_SHEET);
+  if (!src) throw new Error(`Нет листа "${CFG.SOURCE_SHEET}"`);
+  const dst = getOrCreateSnapshotSheet_(ss);
+
+  // Заголовки
+  dst.clear();
+  dst.getRange(1,1,1,CFG.OUTPUT_HEADERS.length).setValues([CFG.OUTPUT_HEADERS]);
+
+  // Заполняем только разрешённые статусы
+  const data = getSourceData_(src);
+  const filtered = data.filter(r => CFG.ALLOWED_STATUSES.has(r.status));
+  const rows = filtered.map(r => [
+    r.id, r.B, r.D, r.E, r.F, r.H, r.I, r.Q, r.status
+  ]);
+  if (rows.length) {
+    dst.getRange(2,1,rows.length, rows[0].length).setValues(rows);
+  }
+
+  // Ставим ежедневный триггер и делаем первый «вчера»-слепок
+  installDailyTrigger_();
+  insertYesterdaySnapshotColumnAndFill_(dst, src);
+
+  // НОВОЕ: привести порядок к источнику
+  reorderBySourceOrder_(dst, src);
+
+  Logger.log('Первичный запуск завершён.');
+}
+
+/** Ежедневная задача (02:00). */
+function runDailySnapshot() {
+  const ss = SpreadsheetApp.getActive();
+  const src = ss.getSheetByName(CFG.SOURCE_SHEET);
+  const dst = getOrCreateSnapshotSheet_(ss);
+  if (!src) throw new Error(`Нет листа "${CFG.SOURCE_SHEET}"`);
+
+  const todayKey = Utilities.formatDate(new Date(), CFG.TIMEZONE, 'yyyyMMdd');
+  const lastKey = CFG.PROP_STORE.getProperty(CFG.PROP_LAST_RUN_DATE);
+  if (lastKey === todayKey) {
+    Logger.log('Этот день уже зафиксирован. Повторный запуск пропущен.');
+    return;
+  }
+
+  // Апсертим левый блок по ID
+  upsertLeftBlockFromSource_(dst, src);
+
+  // Добавляем колонку «вчера» и заполняем
+  insertYesterdaySnapshotColumnAndFill_(dst, src);
+
+  // НОВОЕ: привести порядок к источнику
+  reorderBySourceOrder_(dst, src);
+
+  CFG.PROP_STORE.setProperty(CFG.PROP_LAST_RUN_DATE, todayKey);
+  Logger.log('Слепок за вчера добавлен и порядок синхронизирован с источником.');
+}
+
+/** Вспомогательная: установка триггера 02:00 Europe/Warsaw. */
+function installDailyTrigger_() {
+  ScriptApp.getProjectTriggers()
+    .filter(t => t.getHandlerFunction() === 'runDailySnapshot')
+    .forEach(t => ScriptApp.deleteTrigger(t));
+  ScriptApp.newTrigger('runDailySnapshot')
+    .timeBased().atHour(2).nearMinute(0).everyDays(1)
+    .inTimezone(CFG.TIMEZONE).create();
+  Logger.log('Триггер на 02:00 установлен.');
+}
+
+/** Получить/создать лист "Слепки". */
+function getOrCreateSnapshotSheet_(ss) {
+  let dst = ss.getSheetByName(CFG.SNAPSHOT_SHEET);
+  if (!dst) dst = ss.insertSheet(CFG.SNAPSHOT_SHEET);
+  return dst;
+}
+
+/** Выгрузка исходника. */
+function getSourceData_(srcSheet) {
+  const lastRow = srcSheet.getLastRow();
+  const lastCol = Math.max(
+    CFG.COLS.ID, CFG.COLS.B, CFG.COLS.D, CFG.COLS.E,
+    CFG.COLS.F, CFG.COLS.H, CFG.COLS.I, CFG.COLS.Q, CFG.COLS.STATUS
+  );
+  if (lastRow < 2) return [];
+
+  const rng = srcSheet.getRange(2, 1, lastRow - 1, lastCol);
+  const vals = rng.getValues();
+
+  const rows = [];
+  for (let i = 0; i < vals.length; i++) {
+    const row = vals[i];
+    const id = safe_(row[CFG.COLS.ID - 1]);
+    if (!id) continue;
+    rows.push({
+      id,
+      B: safe_(row[CFG.COLS.B - 1]),
+      D: safe_(row[CFG.COLS.D - 1]),
+      E: safe_(row[CFG.COLS.E - 1]),
+      F: safe_(row[CFG.COLS.F - 1]),
+      H: safe_(row[CFG.COLS.H - 1]),
+      I: safe_(row[CFG.COLS.I - 1]),
+      Q: safe_(row[CFG.COLS.Q - 1]),
+      status: safe_(row[CFG.COLS.STATUS - 1])
+    });
+  }
+  return rows;
+}
+
+/** Апсерт левого блока по ID. */
+function upsertLeftBlockFromSource_(dst, src) {
+  ensureHeaders_(dst);
+  const idToRow = buildIdIndex_(dst);
+  const srcRows = getSourceData_(src);
+
+  const updates = [];
+  const inserts = [];
+
+  for (const r of srcRows) {
+    const values = [r.id, r.B, r.D, r.E, r.F, r.H, r.I, r.Q, r.status];
+    const rowIndex = idToRow.get(r.id);
+    if (rowIndex) {
+      updates.push({ rowIndex, values });
+    } else if (CFG.ALLOWED_STATUSES.has(r.status)) {
+      inserts.push(values);
+    }
+  }
+
+  if (updates.length) {
+    updates.sort((a,b)=>a.rowIndex-b.rowIndex);
+    for (const u of updates) {
+      dst.getRange(u.rowIndex, 1, 1, CFG.OUTPUT_HEADERS.length).setValues([u.values]);
+    }
+  }
+  if (inserts.length) {
+    const startRow = dst.getLastRow() + 1;
+    dst.getRange(startRow, 1, inserts.length, CFG.OUTPUT_HEADERS.length).setValues(inserts);
+  }
+}
+
+/** Добавить колонку «вчера» после "Текущий статус" и заполнить её текущими статусами. */
+function insertYesterdaySnapshotColumnAndFill_(dst, src) {
+  ensureHeaders_(dst);
+
+  const headerRange = dst.getRange(1,1,1,dst.getLastColumn());
+  const headers = headerRange.getValues()[0];
+  const currentIdx0 = headers.indexOf('Текущий статус');
+  if (currentIdx0 === -1) throw new Error('Не найден заголовок "Текущий статус"');
+
+  const insertCol = currentIdx0 + 2; // кол-во в 1-индексации, и ставим сразу ПОСЛЕ
+  dst.insertColumnBefore(insertCol);
+
+  const yesterday = new Date();
+  yesterday.setDate(yesterday.getDate() - 1);
+  const ymd = Utilities.formatDate(yesterday, CFG.TIMEZONE, 'yyyy-MM-dd');
+  dst.getRange(1, insertCol, 1, 1).setValue(ymd);
+
+  const lastRow = dst.getLastRow();
+  if (lastRow >= 2) {
+    const statusCol = currentIdx0 + 1;
+    const statusVals = dst.getRange(2, statusCol, lastRow - 1, 1).getValues();
+    dst.getRange(2, insertCol, lastRow - 1, 1).setValues(statusVals);
+  }
+}
+
+/**
+ * НОВОЕ: Привести порядок строк "Слепки" к порядку ID в источнике.
+ * Логика:
+ * - Создаём в правом краю временный столбец __ORD__
+ * - Для каждого ID ищем его позицию в источнике (1..N); если нет — ставим большое число
+ * - Сортируем всё тело по __ORD__, затем по ID (стабилизация)
+ * - Удаляем __ORD__
+ */
+function reorderBySourceOrder_(dst, src) {
+  ensureHeaders_(dst);
+
+  const lastRow = dst.getLastRow();
+  const lastCol = dst.getLastColumn();
+  if (lastRow < 3) return;
+
+  // Построим карту ID -> позиция в источнике
+  const sourceIds = getSourceData_(src).map(r => r.id);
+  const pos = new Map(); // id -> index (1..N)
+  for (let i = 0; i < sourceIds.length; i++) pos.set(sourceIds[i], i + 1);
+
+  // Вставляем временный столбец __ORD__ справа
+  dst.insertColumnAfter(lastCol);
+  const ordCol = lastCol + 1;
+  dst.getRange(1, ordCol).setValue('__ORD__');
+
+  // Проставим порядковые
+  const idVals = dst.getRange(2, 1, lastRow - 1, 1).getValues().map(r => String(r[0] || '').trim());
+  const big = 1e9;
+  const ordVals = idVals.map(id => [ pos.has(id) ? pos.get(id) : big ]);
+  dst.getRange(2, ordCol, lastRow - 1, 1).setValues(ordVals);
+
+  // Сортируем по __ORD__, затем по ID (для детерминизма)
+  dst.getRange(2, 1, lastRow - 1, ordCol).sort([
+    { column: ordCol, ascending: true },
+    { column: 1, ascending: true }
+  ]);
+
+  // Удаляем служебный столбец
+  dst.deleteColumn(ordCol);
+}
+
+/** Заголовки. */
+function ensureHeaders_(dst) {
+  const need = CFG.OUTPUT_HEADERS;
+  const existing = dst.getRange(1,1,1, Math.max(dst.getLastColumn(), need.length)).getValues()[0];
+  let mismatch = false;
+  for (let i = 0; i < need.length; i++) {
+    if (existing[i] !== need[i]) { mismatch = true; break; }
+  }
+  if (mismatch) dst.getRange(1,1,1,need.length).setValues([need]);
+}
+
+/** Индекс ID -> rowIndex. */
+function buildIdIndex_(dst) {
+  const map = new Map();
+  const lastRow = dst.getLastRow();
+  if (lastRow < 2) return map;
+  const idVals = dst.getRange(2,1,lastRow-1,1).getValues();
+  for (let i = 0; i < idVals.length; i++) {
+    const id = String(idVals[i][0] || '').trim();
+    if (!id) continue;
+    const rowIndex = 2 + i;
+    if (!map.has(id)) map.set(id, rowIndex);
+  }
+  return map;
+}
+
+function safe_(v){ return (v === null || v === undefined) ? '' : String(v); }
+
+/** Удалить триггер (при необходимости). */
+function removeDailyTrigger() {
+  ScriptApp.getProjectTriggers()
+    .filter(t => t.getHandlerFunction() === 'runDailySnapshot')
+    .forEach(t => ScriptApp.deleteTrigger(t));
+}
+
+/** Ручной запуск только для перестройки порядка (если нужно быстро). */
+function reorderNow() {
+  const ss = SpreadsheetApp.getActive();
+  const src = ss.getSheetByName(CFG.SOURCE_SHEET);
+  const dst = getOrCreateSnapshotSheet_(ss);
+  reorderBySourceOrder_(dst, src);
+}
