@@ -1,0 +1,263 @@
+/**
+ * "Статусник" — счётчики статусов из "Ниши 2.0"
+ * Разметка блоков: ядро (8 строк) → 2 пустые → 3 доп-статуса → 3 пустые → Бан, Бан(переч.)
+ * Общий: ядро 3–10, доп 13–15, бан 19–20 (пустые 11–12 и 16–18)
+ * Диана: ядро 26–33, доп 36–38, бан 42–43 (пустые 34–35 и 39–41)
+ * Анжелика: ядро 48–55, доп 58–60, бан 64–65 (пустые 56–57 и 61–63)
+ * C1 = дата съёма dd.MM.yy
+ * Без setNote.
+ * Версия: v2.4
+ */
+function snapshotStatuses() {
+  var SS   = SpreadsheetApp.getActiveSpreadsheet();
+  var TZ   = SS.getSpreadsheetTimeZone() || 'Europe/Warsaw';
+  var SRC  = SS.getSheetByName('Ниши 2.0');
+  var DEST = SS.getSheetByName('Статусник');
+  if (!SRC) throw new Error('Не найдена вкладка "Ниши 2.0".');
+  if (!DEST) throw new Error('Не найдена вкладка "Статусник".');
+
+  // Базовые (ядро)
+  var CORE = [
+    { key: 'SEM',   label: 'Сбор семантики' },
+    { key: 'W0',    label: '0. Пиши текст' },
+    { key: 'W01',   label: '0.1 Доработай' },
+    { key: 'W1',    label: '1. Написан, Проверяй' },
+    { key: 'W2',    label: '2. Размещай' },
+    { key: 'W3',    label: '3. Размещаю' },
+    { key: 'W4',    label: '4. Размещено, проверяй' },
+    { key: 'NIDX',  label: 'не в индексе' }
+  ];
+
+  // Доп-статусы
+  var EXTRA_LABELS = {
+    AFF:     'Партнерка есть',
+    MON:     'На отслеживании',
+    AFF_ADD: 'Добавить партнеркуу',
+    BAN:     'Бан',
+    BAN_S:   'Бан (перечёркнутый)'
+  };
+
+  // Карта текст -> key (для текстовых сравнений)
+  var mapLabelToKey = {
+    'Сбор семантики':           'SEM',
+    '0. Пиши текст':            'W0',
+    '0.1 Доработай':            'W01',
+    '1. Написан, Проверяй':     'W1',
+    '2. Размещай':              'W2',
+    '3. Размещаю':              'W3',
+    '4. Размещено, проверяй':   'W4',
+    'не в индексе':             'NIDX',
+    'Партнерка есть':           'AFF',
+    'На отслеживании':          'MON',
+    'Добавить партнеркуу':      'AFF_ADD'
+  };
+
+  // Ряды блоков
+  var ROWS_COMMON_CORE  = 3;
+  var ROWS_COMMON_EXTRA = { AFF: 13, MON: 14, AFF_ADD: 15, BAN: 19, BAN_S: 20 };
+
+  var ROWS_DIANA_CORE   = 26;
+  var ROWS_DIANA_EXTRA  = { AFF: 36, MON: 37, AFF_ADD: 38, BAN: 42, BAN_S: 43 };
+
+  var ROWS_ANNA_CORE    = 48;
+  var ROWS_ANNA_EXTRA   = { AFF: 58, MON: 59, AFF_ADD: 60, BAN: 64, BAN_S: 65 };
+
+  // Подписи B для всех блоков
+  placeLabels_(DEST, CORE, ROWS_COMMON_CORE);
+  ensureLabel_(DEST, ROWS_COMMON_EXTRA.AFF,     'B', EXTRA_LABELS.AFF);
+  ensureLabel_(DEST, ROWS_COMMON_EXTRA.MON,     'B', EXTRA_LABELS.MON);
+  ensureLabel_(DEST, ROWS_COMMON_EXTRA.AFF_ADD, 'B', EXTRA_LABELS.AFF_ADD);
+  ensureLabel_(DEST, ROWS_COMMON_EXTRA.BAN,     'B', EXTRA_LABELS.BAN);
+  ensureLabel_(DEST, ROWS_COMMON_EXTRA.BAN_S,   'B', EXTRA_LABELS.BAN_S);
+
+  placeLabels_(DEST, CORE, ROWS_DIANA_CORE);
+  ensureLabel_(DEST, ROWS_DIANA_EXTRA.AFF,     'B', EXTRA_LABELS.AFF);
+  ensureLabel_(DEST, ROWS_DIANA_EXTRA.MON,     'B', EXTRA_LABELS.MON);
+  ensureLabel_(DEST, ROWS_DIANA_EXTRA.AFF_ADD, 'B', EXTRA_LABELS.AFF_ADD);
+  ensureLabel_(DEST, ROWS_DIANA_EXTRA.BAN,     'B', EXTRA_LABELS.BAN);
+  ensureLabel_(DEST, ROWS_DIANA_EXTRA.BAN_S,   'B', EXTRA_LABELS.BAN_S);
+
+  placeLabels_(DEST, CORE, ROWS_ANNA_CORE);
+  ensureLabel_(DEST, ROWS_ANNA_EXTRA.AFF,     'B', EXTRA_LABELS.AFF);
+  ensureLabel_(DEST, ROWS_ANNA_EXTRA.MON,     'B', EXTRA_LABELS.MON);
+  ensureLabel_(DEST, ROWS_ANNA_EXTRA.AFF_ADD, 'B', EXTRA_LABELS.AFF_ADD);
+  ensureLabel_(DEST, ROWS_ANNA_EXTRA.BAN,     'B', EXTRA_LABELS.BAN);
+  ensureLabel_(DEST, ROWS_ANNA_EXTRA.BAN_S,   'B', EXTRA_LABELS.BAN_S);
+
+  // Дата съёма
+  DEST.getRange(1, 3).setValue(Utilities.formatDate(new Date(), TZ, 'dd.MM.yy'));
+
+  // Если нет данных — обнулим и выйдем
+  var lastRow = SRC.getLastRow();
+  if (lastRow < 2) {
+    clearCountsBlock_(DEST, CORE, ROWS_COMMON_CORE);
+    clearCountsExtraMap_(DEST, ROWS_COMMON_EXTRA);
+    clearCountsBlock_(DEST, CORE, ROWS_DIANA_CORE);
+    clearCountsExtraMap_(DEST, ROWS_DIANA_EXTRA);
+    clearCountsBlock_(DEST, CORE, ROWS_ANNA_CORE);
+    clearCountsExtraMap_(DEST, ROWS_ANNA_EXTRA);
+    return;
+  }
+
+  // Забираем данные
+  var statusCol = 7; // G
+  var staffCol  = 2; // B
+  var n = lastRow - 1;
+
+  var rngStatus = SRC.getRange(2, statusCol, n, 1);
+  var rngStaff  = SRC.getRange(2, staffCol,  n, 1);
+
+  var values    = rngStatus.getValues();         // [[status],...]
+  var rich      = rngStatus.getRichTextValues(); // [[RTV],...]
+  var staffVals = rngStaff.getValues();          // [[letter],...]
+
+  // Счётчики
+  var countsCommonCore  = makeEmptyCounts_(CORE);
+  var countsCommonExtra = makeEmptyCountsFromLabels_(EXTRA_LABELS);
+
+  var countsDianaCore   = makeEmptyCounts_(CORE);
+  var countsDianaExtra  = makeEmptyCountsFromLabels_(EXTRA_LABELS);
+
+  var countsAnnaCore    = makeEmptyCounts_(CORE);
+  var countsAnnaExtra   = makeEmptyCountsFromLabels_(EXTRA_LABELS);
+
+  for (var i = 0; i < n; i++) {
+    var rawStatus = String(values[i][0]);
+    var status = normalizeStatusText_(rawStatus);
+    var staff = String(staffVals[i][0] || '').trim().toLowerCase();
+
+    // Бан — по зачёркиванию
+    if (status === 'Бан') {
+      var struck = isStruck_(rich[i][0]);
+      var banKey = struck ? 'BAN_S' : 'BAN';
+      countsCommonExtra[banKey]++;
+      if (staff === 'д' || staff === 'к') countsDianaExtra[banKey]++;
+      if (staff === 'а' || staff === 'a') countsAnnaExtra[banKey]++;
+      continue;
+    }
+
+    var key = mapLabelToKey[status];
+    if (!key) continue;
+
+    // Ядро или доп?
+    if (key in countsCommonCore) {
+      countsCommonCore[key]++;
+      if (staff === 'д' || staff === 'к') countsDianaCore[key]++;
+      if (staff === 'а' || staff === 'a') countsAnnaCore[key]++;
+    } else if (key in countsCommonExtra) {
+      countsCommonExtra[key]++;
+      if (staff === 'д' || staff === 'к') countsDianaExtra[key]++;
+      if (staff === 'а' || staff === 'a') countsAnnaExtra[key]++;
+    }
+  }
+
+  // Запись: общий
+  writeCountsBlock_(DEST, CORE, ROWS_COMMON_CORE, countsCommonCore);
+  DEST.getRange(ROWS_COMMON_EXTRA.AFF,     3).setValue(countsCommonExtra.AFF || 0);
+  DEST.getRange(ROWS_COMMON_EXTRA.MON,     3).setValue(countsCommonExtra.MON || 0);
+  DEST.getRange(ROWS_COMMON_EXTRA.AFF_ADD, 3).setValue(countsCommonExtra.AFF_ADD || 0);
+  DEST.getRange(ROWS_COMMON_EXTRA.BAN,     3).setValue(countsCommonExtra.BAN || 0);
+  DEST.getRange(ROWS_COMMON_EXTRA.BAN_S,   3).setValue(countsCommonExtra.BAN_S || 0);
+
+  // Запись: Диана
+  writeCountsBlock_(DEST, CORE, ROWS_DIANA_CORE, countsDianaCore);
+  DEST.getRange(ROWS_DIANA_EXTRA.AFF,     3).setValue(countsDianaExtra.AFF || 0);
+  DEST.getRange(ROWS_DIANA_EXTRA.MON,     3).setValue(countsDianaExtra.MON || 0);
+  DEST.getRange(ROWS_DIANA_EXTRA.AFF_ADD, 3).setValue(countsDianaExtra.AFF_ADD || 0);
+  DEST.getRange(ROWS_DIANA_EXTRA.BAN,     3).setValue(countsDianaExtra.BAN || 0);
+  DEST.getRange(ROWS_DIANA_EXTRA.BAN_S,   3).setValue(countsDianaExtra.BAN_S || 0);
+
+  // Запись: Анжелика
+  writeCountsBlock_(DEST, CORE, ROWS_ANNA_CORE, countsAnnaCore);
+  DEST.getRange(ROWS_ANNA_EXTRA.AFF,     3).setValue(countsAnnaExtra.AFF || 0);
+  DEST.getRange(ROWS_ANNA_EXTRA.MON,     3).setValue(countsAnnaExtra.MON || 0);
+  DEST.getRange(ROWS_ANNA_EXTRA.AFF_ADD, 3).setValue(countsAnnaExtra.AFF_ADD || 0);
+  DEST.getRange(ROWS_ANNA_EXTRA.BAN,     3).setValue(countsAnnaExtra.BAN || 0);
+  DEST.getRange(ROWS_ANNA_EXTRA.BAN_S,   3).setValue(countsAnnaExtra.BAN_S || 0);
+}
+
+/* ---------- helpers ---------- */
+
+// Подписи B для списка статусов подряд с заданной стартовой строки
+function placeLabels_(sheet, list, startRow) {
+  for (var i = 0; i < list.length; i++) {
+    ensureLabel_(sheet, startRow + i, 'B', list[i].label);
+  }
+}
+
+// Очистка блока значений C подряд
+function clearCountsBlock_(sheet, list, startRow) {
+  for (var i = 0; i < list.length; i++) {
+    sheet.getRange(startRow + i, 3).setValue(0);
+  }
+}
+
+// Очистка набора адресов доп-строк (map)
+function clearCountsExtraMap_(sheet, rowsMap) {
+  for (var k in rowsMap) {
+    sheet.getRange(rowsMap[k], 3).setValue(0);
+  }
+}
+
+// Запись блока значений C подряд
+function writeCountsBlock_(sheet, list, startRow, countsObj) {
+  for (var i = 0; i < list.length; i++) {
+    var key = list[i].key;
+    sheet.getRange(startRow + i, 3).setValue(countsObj[key] || 0);
+  }
+}
+
+// Нулевой словарь по ключам CORE/EXTRA
+function makeEmptyCounts_(list) {
+  var o = {};
+  for (var i = 0; i < list.length; i++) o[list[i].key] = 0;
+  return o;
+}
+function makeEmptyCountsFromLabels_(labelsObj) {
+  var o = {};
+  for (var k in labelsObj) o[k] = 0;
+  return o;
+}
+
+// Нормализуем строку статуса: trim + снятие крайних двойных кавычек
+function normalizeStatusText_(s) {
+  var t = String(s == null ? '' : s).trim();
+  if (t.length >= 2 && t.charAt(0) === '"' && t.charAt(t.length - 1) === '"') {
+    t = t.substring(1, t.length - 1).trim();
+  }
+  return t;
+}
+
+// true, если есть зачёркивание
+function isStruck_(richTextValue) {
+  if (!richTextValue) return false;
+  if (typeof richTextValue.getRuns === 'function') {
+    var runs = richTextValue.getRuns();
+    if (runs && runs.length) {
+      for (var r = 0; r < runs.length; r++) {
+        var ts = runs[r].getTextStyle && runs[r].getTextStyle();
+        if (ts && ts.isStrikethrough && ts.isStrikethrough()) return true;
+      }
+      return false;
+    }
+  }
+  var ts = richTextValue.getTextStyle && richTextValue.getTextStyle();
+  return !!(ts && ts.isStrikethrough && ts.isStrikethrough());
+}
+
+// Гарантирует подпись в B
+function ensureLabel_(sheet, row, colLetter, text) {
+  var cell = sheet.getRange(colLetter + String(row));
+  if (!String(cell.getValue()).trim()) cell.setValue(text);
+}
+
+/** Триггер каждые 4 часа — без изменений */
+function createEvery4HoursTrigger() {
+  var triggers = ScriptApp.getProjectTriggers();
+  for (var i = 0; i < triggers.length; i++) {
+    if (triggers[i].getHandlerFunction() === 'snapshotStatuses') {
+      ScriptApp.deleteTrigger(triggers[i]);
+    }
+  }
+  ScriptApp.newTrigger('snapshotStatuses').timeBased().everyHours(4).create();
+}
