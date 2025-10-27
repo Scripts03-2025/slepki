@@ -1,0 +1,150 @@
+/**
+ * Статусы -> "Статусник"
+ * B3/C3  = Сбор семантики
+ * B4/C4  = 0. Пиши текст
+ * B5/C5  = 0.1 Доработай
+ * B6/C6  = 1. Написан, Проверяй
+ * B7/C7  = 2. Размещай
+ * B8/C8  = 3. Размещаю
+ * B9/C9  = 4. Размещено, проверяй
+ * B10/C10= не в индексе
+ * (оставлены ранее)
+ * B13/C13= Партнерка есть
+ * B14/C14= На отслеживании
+ * B15/C15= Добавить партнеркуу
+ * B19/C19= Бан
+ * B20/C20= Бан (перечёркнутый)
+ * + C1 = дата съёма dd.MM.yy
+ * Версия: v2.1
+ */
+function snapshotStatuses() {
+  var SS   = SpreadsheetApp.getActiveSpreadsheet();
+  var TZ   = SS.getSpreadsheetTimeZone() || 'Europe/Warsaw';
+  var SRC  = SS.getSheetByName('Ниши 2.0');
+  var DEST = SS.getSheetByName('Статусник');
+  if (!SRC) throw new Error('Не найдена вкладка "Ниши 2.0".');
+  if (!DEST) throw new Error('Не найдена вкладка "Статусник".');
+
+  var TARGETS = [
+    { key: 'SEM',     label: 'Сбор семантики',           row: 3 },
+    { key: 'W0',      label: '0. Пиши текст',            row: 4 },
+    { key: 'W01',     label: '0.1 Доработай',            row: 5 },
+    { key: 'W1',      label: '1. Написан, Проверяй',     row: 6 },
+    { key: 'W2',      label: '2. Размещай',              row: 7 },
+    { key: 'W3',      label: '3. Размещаю',              row: 8 },
+    { key: 'W4',      label: '4. Размещено, проверяй',   row: 9 },
+    { key: 'NIDX',    label: 'не в индексе',             row: 10 },
+    // прежние
+    { key: 'AFF',     label: 'Партнерка есть',           row: 13 },
+    { key: 'MON',     label: 'На отслеживании',          row: 14 },
+    { key: 'AFF_ADD', label: 'Добавить партнеркуу',      row: 15 },
+    { key: 'BAN',     label: 'Бан',                      row: 19 },
+    { key: 'BAN_S',   label: 'Бан (перечёркнутый)',      row: 20 }
+  ];
+
+  var statusCol = 7; // G
+  var lastRow   = SRC.getLastRow();
+  var now       = new Date();
+  var nowNote   = 'Обновлено: ' + Utilities.formatDate(now, TZ, 'yyyy-MM-dd HH:mm') + ' (' + TZ + ')';
+
+  // подписи слева (B)
+  for (var i = 0; i < TARGETS.length; i++) {
+    ensureLabel_(DEST, TARGETS[i].row, 'B', TARGETS[i].label);
+  }
+
+  // дата съёма в C1
+  DEST.getRange(1, 3).setValue(Utilities.formatDate(now, TZ, 'dd.MM.yy')).setNote(nowNote);
+
+  if (lastRow < 2) {
+    for (var j = 0; j < TARGETS.length; j++) {
+      DEST.getRange(TARGETS[j].row, 3).setValue(0).setNote(nowNote);
+    }
+    return;
+  }
+
+  // забираем значения и rich-текст для проверки зачёркивания
+  var range  = SRC.getRange(2, statusCol, lastRow - 1, 1);
+  var values = range.getValues();
+  var rich   = range.getRichTextValues();
+
+  var counts = {};
+  for (i = 0; i < TARGETS.length; i++) counts[TARGETS[i].key] = 0;
+
+  // карта "текст статуса" -> key; сравнение по нормализованной строке
+  var mapLabelToKey = {
+    'Сбор семантики':           'SEM',
+    '0. Пиши текст':            'W0',
+    '0.1 Доработай':            'W01',
+    '1. Написан, Проверяй':     'W1',
+    '2. Размещай':              'W2',
+    '3. Размещаю':              'W3',
+    '4. Размещено, проверяй':   'W4',
+    'не в индексе':             'NIDX',
+    'Партерка есть':            'AFF',     // на случай опечаток, не учитываем
+    'Партнерка есть':           'AFF',
+    'На отслеживании':          'MON',
+    'Добавить партнеркуу':      'AFF_ADD'
+  };
+
+  for (i = 0; i < values.length; i++) {
+    var raw = String(values[i][0]);
+    var text = normalizeStatusText_(raw);
+
+    if (text === 'Бан') {
+      var struck = isStruck_(rich[i][0]);
+      counts[struck ? 'BAN_S' : 'BAN']++;
+      continue;
+    }
+
+    var key = mapLabelToKey[text];
+    if (key) counts[key]++;
+  }
+
+  // запись итогов (в C-колонку)
+  for (i = 0; i < TARGETS.length; i++) {
+    DEST.getRange(TARGETS[i].row, 3).setValue(counts[TARGETS[i].key]).setNote(nowNote);
+  }
+}
+
+/** Нормализуем строку статуса: trim + снятие крайних двойных кавычек */
+function normalizeStatusText_(s) {
+  var t = String(s == null ? '' : s).trim();
+  if (t.length >= 2 && t.charAt(0) === '"' && t.charAt(t.length - 1) === '"') {
+    t = t.substring(1, t.length - 1).trim();
+  }
+  return t;
+}
+
+/** true, если у текста выставлен зачёркнутый стиль (частично или полностью) */
+function isStruck_(richTextValue) {
+  if (!richTextValue) return false;
+  if (typeof richTextValue.getRuns === 'function') {
+    var runs = richTextValue.getRuns();
+    if (runs && runs.length) {
+      for (var r = 0; r < runs.length; r++) {
+        var ts = runs[r].getTextStyle && runs[r].getTextStyle();
+        if (ts && ts.isStrikethrough && ts.isStrikethrough()) return true;
+      }
+      return false;
+    }
+  }
+  var ts = richTextValue.getTextStyle && richTextValue.getTextStyle();
+  return !!(ts && ts.isStrikethrough && ts.isStrikethrough());
+}
+
+/** Гарантирует подпись в B-колонке на нужной строке */
+function ensureLabel_(sheet, row, colLetter, text) {
+  var cell = sheet.getRange(colLetter + String(row));
+  if (!String(cell.getValue()).trim()) cell.setValue(text);
+}
+
+/** Триггер каждые 4 часа (разово запусти, если ещё не делал) */
+function createEvery4HoursTrigger() {
+  var triggers = ScriptApp.getProjectTriggers();
+  for (var i = 0; i < triggers.length; i++) {
+    if (triggers[i].getHandlerFunction() === 'snapshotStatuses') {
+      ScriptApp.deleteTrigger(triggers[i]);
+    }
+  }
+  ScriptApp.newTrigger('snapshotStatuses').timeBased().everyHours(4).create();
+}
