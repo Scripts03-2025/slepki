@@ -1,0 +1,334 @@
+/**
+ * Слепки статусов v1.0.0
+ *
+ * Источник: лист "Ниши 2.0"
+ * Снимки (слепки): лист "Слепки"
+ *
+ * Логика:
+ * - Слева фикс-блок: ID, B, D, E, F, H, I, Q, "Текущий статус"
+ * - Сразу справа — ежедневные слепки. Каждый день в 02:00 вставляем НОВУЮ колонку
+ *   сразу после "Текущий статус" с названием ДАТЫ ВЧЕРА (Europe/Warsaw) и
+ *   записываем туда текущий статус как "слепок предыдущего дня".
+ * - Первый запуск: включаем ТОЛЬКО строки, у которых статус ∈ ALLOWED_STATUSES.
+ *   После — строки не удаляются даже при смене статуса (опускаются вниз).
+ * - Поиск/сопоставление по уникальному ID (колонка A в исходнике).
+ *
+ * Тред ChatGPT с постановкой задачи:
+ * https://chatgpt.com/g/g-p-6846f7c926348191b3ff0ea16ca0ad2b/c/68f67726-b9c4-832f-81c6-c658d0826323
+ */
+
+const CFG = {
+  SOURCE_SHEET: 'Ниши 2.0',
+  SNAPSHOT_SHEET: 'Слепки',
+  // какие столбцы копируем из источника (A=1)
+  COLS: {
+    ID: 1,   // A
+    B: 2,    // B
+    D: 4,    // D
+    E: 5,    // E
+    F: 6,    // F
+    H: 8,    // H
+    I: 9,    // I
+    Q: 17,   // Q
+    STATUS: 7 // G (текущий статус)
+  },
+  // порядок вывода слева в "Слепки"
+  OUTPUT_HEADERS: ['ID','B','D','E','F','H','I','Q','Текущий статус'],
+  // активные статусы (верх списка)
+  ALLOWED_STATUSES: new Set([
+    '0. Текст пишется',
+    '2. Размещай',
+    '3. Размещаю',
+    '4. Размещено, проверяй не в индексе'
+  ]),
+  TIMEZONE: 'Europe/Warsaw',
+  // служебные свойства
+  PROP_STORE: PropertiesService.getScriptProperties(),
+  PROP_LAST_RUN_DATE: 'last_run_yymmdd'
+};
+
+/**
+ * Ручной ПЕРВЫЙ запуск
+ * - создаёт/очищает структуру "Слепки"
+ * - заполняет только строки с ALLOWED_STATUSES
+ * - ставит триггер на 02:00
+ */
+function setupFirstRun() {
+  const ss = SpreadsheetApp.getActive();
+  const src = ss.getSheetByName(CFG.SOURCE_SHEET);
+  if (!src) throw new Error(`Нет листа "${CFG.SOURCE_SHEET}"`);
+
+  const dst = getOrCreateSnapshotSheet_(ss);
+  // Заголовки
+  dst.clear();
+  dst.getRange(1,1,1,CFG.OUTPUT_HEADERS.length).setValues([CFG.OUTPUT_HEADERS]);
+
+  // Выкачиваем исходник
+  const data = getSourceData_(src);
+  const filtered = data.filter(r => CFG.ALLOWED_STATUSES.has(r.status));
+  const rows = filtered.map(r => [
+    r.id, r.B, r.D, r.E, r.F, r.H, r.I, r.Q, r.status
+  ]);
+
+  if (rows.length) {
+    dst.getRange(2,1,rows.length, rows[0].length).setValues(rows);
+  }
+
+  // Сортировка: активные сверху
+  sortSnapshotByActive_(dst);
+
+  // Ставим ежедневный триггер на 02:00
+  installDailyTrigger_();
+
+  // Первый снимок: создадим колонку "вчера" и запишем значения
+  insertYesterdaySnapshotColumnAndFill_(dst, src);
+
+  Logger.log('Первичный запуск завершён.');
+}
+
+/**
+ * Ежедневная задача (триггер 02:00):
+ * - обновляет блок слева (ID, поля, "Текущий статус": апсерт по ID)
+ * - добавляет колонку слепка "вчера" и пишет статусы
+ * - сортирует: активные статусы наверху
+ */
+function runDailySnapshot() {
+  const ss = SpreadsheetApp.getActive();
+  const src = ss.getSheetByName(CFG.SOURCE_SHEET);
+  const dst = getOrCreateSnapshotSheet_(ss);
+  if (!src) throw new Error(`Нет листа "${CFG.SOURCE_SHEET}"`);
+
+  // Предотвращаем дубли в один день (если вдруг триггер сработал дважды)
+  const todayKey = Utilities.formatDate(new Date(), CFG.TIMEZONE, 'yyyyMMdd');
+  const lastKey = CFG.PROP_STORE.getProperty(CFG.PROP_LAST_RUN_DATE);
+  if (lastKey === todayKey) {
+    Logger.log('Этот день уже зафиксирован. Повторный запуск пропущен.');
+    return;
+  }
+
+  // Апсертим/обновляем левый блок по ID
+  upsertLeftBlockFromSource_(dst, src);
+
+  // Вставляем новую колонку "снимка вчера" и заполняем
+  insertYesterdaySnapshotColumnAndFill_(dst, src);
+
+  // Сортируем (активные вверх)
+  sortSnapshotByActive_(dst);
+
+  CFG.PROP_STORE.setProperty(CFG.PROP_LAST_RUN_DATE, todayKey);
+  Logger.log('Слепок за вчера добавлен.');
+}
+
+/** Установка ежесуточного триггера на 02:00 (Europe/Warsaw). */
+function installDailyTrigger_() {
+  // Чистим старые триггеры этой функции
+  ScriptApp.getProjectTriggers()
+    .filter(t => t.getHandlerFunction() === 'runDailySnapshot')
+    .forEach(t => ScriptApp.deleteTrigger(t));
+
+  // Ставим новый
+  ScriptApp.newTrigger('runDailySnapshot')
+    .timeBased()
+    .atHour(2)
+    .nearMinute(0)
+    .everyDays(1)
+    .inTimezone(CFG.TIMEZONE)
+    .create();
+
+  Logger.log('Триггер на 02:00 установлен.');
+}
+
+/** Сервис: получить/создать лист "Слепки". */
+function getOrCreateSnapshotSheet_(ss) {
+  let dst = ss.getSheetByName(CFG.SNAPSHOT_SHEET);
+  if (!dst) dst = ss.insertSheet(CFG.SNAPSHOT_SHEET);
+  return dst;
+}
+
+/** Выгрузка исходных данных из "Ниши 2.0" по нужным колонкам. */
+function getSourceData_(srcSheet) {
+  const lastRow = srcSheet.getLastRow();
+  const lastCol = Math.max(
+    CFG.COLS.ID, CFG.COLS.B, CFG.COLS.D, CFG.COLS.E,
+    CFG.COLS.F, CFG.COLS.H, CFG.COLS.I, CFG.COLS.Q, CFG.COLS.STATUS
+  );
+  if (lastRow < 2) return [];
+
+  const rng = srcSheet.getRange(2, 1, lastRow - 1, lastCol);
+  const vals = rng.getValues();
+
+  const rows = [];
+  for (let i = 0; i < vals.length; i++) {
+    const row = vals[i];
+    const id = safe_(row[CFG.COLS.ID - 1]);
+    if (!id) continue; // пропускаем пустые ID
+
+    rows.push({
+      id,
+      B: safe_(row[CFG.COLS.B - 1]),
+      D: safe_(row[CFG.COLS.D - 1]),
+      E: safe_(row[CFG.COLS.E - 1]),
+      F: safe_(row[CFG.COLS.F - 1]),
+      H: safe_(row[CFG.COLS.H - 1]),
+      I: safe_(row[CFG.COLS.I - 1]),
+      Q: safe_(row[CFG.COLS.Q - 1]),
+      status: safe_(row[CFG.COLS.STATUS - 1])
+    });
+  }
+  return rows;
+}
+
+/** Апсертим левый блок "Слепки" из источника по ID. */
+function upsertLeftBlockFromSource_(dst, src) {
+  // Убедимся в заголовках
+  ensureHeaders_(dst);
+
+  // Карта: ID -> строка в "Слепки"
+  const idToRow = buildIdIndex_(dst);
+
+  // Текущие данные источника
+  const srcRows = getSourceData_(src);
+
+  // Соберём батчи обновлений существующих и вставок новых
+  const updates = []; // {rowIndex, values}
+  const inserts = []; // [values]
+
+  // На первом попадании берём только разрешённые. Но «после» — новые тоже по разрешённым.
+  // Для существующих — всегда обновляем поля слева и "Текущий статус".
+  for (const r of srcRows) {
+    const values = [r.id, r.B, r.D, r.E, r.F, r.H, r.I, r.Q, r.status];
+    const rowIndex = idToRow.get(r.id);
+    if (rowIndex) {
+      updates.push({ rowIndex, values });
+    } else {
+      // Новые строки добавляем только если статус разрешён
+      if (CFG.ALLOWED_STATUSES.has(r.status)) {
+        inserts.push(values);
+      }
+    }
+  }
+
+  // Применяем updates
+  if (updates.length) {
+    // Пишем пачками
+    updates.sort((a,b)=>a.rowIndex-b.rowIndex);
+    let start = 0;
+    while (start < updates.length) {
+      let end = start;
+      let expected = updates[start].rowIndex;
+      while (end < updates.length && updates[end].rowIndex === expected) {
+        expected++;
+        end++;
+      }
+      // т.к. строки идут по одной, пишем поштучно (микрооптимизация не критична)
+      for (let i = start; i < end; i++) {
+        const u = updates[i];
+        dst.getRange(u.rowIndex, 1, 1, CFG.OUTPUT_HEADERS.length).setValues([u.values]);
+      }
+      start = end;
+    }
+  }
+
+  // Добавляем новые
+  if (inserts.length) {
+    const startRow = dst.getLastRow() + 1;
+    dst.getRange(startRow, 1, inserts.length, CFG.OUTPUT_HEADERS.length).setValues(inserts);
+  }
+}
+
+/** Вставляет колонку «вчера» сразу справа от "Текущий статус" и заполняет её значениями текущего статуса. */
+function insertYesterdaySnapshotColumnAndFill_(dst, src) {
+  ensureHeaders_(dst);
+
+  // Вычисляем позицию колонки "Текущий статус"
+  const headerRange = dst.getRange(1,1,1,dst.getLastColumn());
+  const headers = headerRange.getValues()[0];
+  const currentIdx = headers.indexOf('Текущий статус');
+  if (currentIdx === -1) throw new Error('Не найден заголовок "Текущий статус"');
+
+  // Вставляем новую колонку СРАЗУ ПОСЛЕ него (index с 0, но в Sheets — с 1)
+  const insertCol = currentIdx + 2; // +1 (к 1-индексации) +1 (после)
+  dst.insertColumnBefore(insertCol);
+
+  // Заголовок даты «вчера» по таймзоне
+  const yesterday = new Date();
+  yesterday.setDate(yesterday.getDate() - 1);
+  const ymd = Utilities.formatDate(yesterday, CFG.TIMEZONE, 'yyyy-MM-dd');
+  dst.getRange(1, insertCol, 1, 1).setValue(ymd);
+
+  // Проставим значения = текущий статус (из левого блока)
+  const lastRow = dst.getLastRow();
+  if (lastRow >= 2) {
+    const statusCol = currentIdx + 1; // позиция "Текущий статус" (1-индексация)
+    const statusVals = dst.getRange(2, statusCol, lastRow - 1, 1).getValues();
+    dst.getRange(2, insertCol, lastRow - 1, 1).setValues(statusVals);
+  }
+}
+
+/** Сортируем: активные статусы (из набора) наверху, остальные — ниже. */
+function sortSnapshotByActive_(dst) {
+  ensureHeaders_(dst);
+  const lastRow = dst.getLastRow();
+  const lastCol = dst.getLastColumn();
+  if (lastRow < 3) return;
+
+  const headerRange = dst.getRange(1,1,1,lastCol);
+  const headers = headerRange.getValues()[0];
+  const statusCol = headers.indexOf('Текущий статус') + 1;
+
+  // Добавим временный служебный столбец в самый правый край с флагом "неактивности"
+  dst.insertColumnAfter(lastCol);
+  const flagCol = lastCol + 1;
+  dst.getRange(1, flagCol).setValue('__FLAG__');
+
+  const statuses = dst.getRange(2, statusCol, lastRow - 1, 1).getValues().map(r => String(r[0] || ''));
+  const flags = statuses.map(s => [ CFG.ALLOWED_STATUSES.has(s) ? 0 : 1 ]);
+  dst.getRange(2, flagCol, lastRow - 1, 1).setValues(flags);
+
+  // Сортируем всё тело по флагу, затем по ID (вторичная стабилизация)
+  const idCol = 1;
+  dst.getRange(2, 1, lastRow - 1, flagCol).sort([
+    { column: flagCol, ascending: true },
+    { column: idCol, ascending: true }
+  ]);
+
+  // Удаляем служебный столбец
+  dst.deleteColumn(flagCol);
+}
+
+/** Заголовки для "Слепки" гарантируем. */
+function ensureHeaders_(dst) {
+  const need = CFG.OUTPUT_HEADERS;
+  const existing = dst.getRange(1,1,1, Math.max(dst.getLastColumn(), need.length)).getValues()[0];
+  let mismatch = false;
+  for (let i = 0; i < need.length; i++) {
+    if (existing[i] !== need[i]) { mismatch = true; break; }
+  }
+  if (mismatch) {
+    dst.getRange(1,1,1,need.length).setValues([need]);
+  }
+}
+
+/** Индекс ID -> rowIndex в листе "Слепки". */
+function buildIdIndex_(dst) {
+  const map = new Map();
+  const lastRow = dst.getLastRow();
+  if (lastRow < 2) return map;
+  const idVals = dst.getRange(2,1,lastRow-1,1).getValues();
+  for (let i = 0; i < idVals.length; i++) {
+    const id = String(idVals[i][0] || '').trim();
+    if (!id) continue;
+    const rowIndex = 2 + i;
+    if (!map.has(id)) map.set(id, rowIndex); // первый встретившийся
+  }
+  return map;
+}
+
+function safe_(v){ return (v === null || v === undefined) ? '' : String(v); }
+
+/** Вспомогательная: удалить триггер (если нужно вручную). */
+function removeDailyTrigger() {
+  ScriptApp.getProjectTriggers()
+    .filter(t => t.getHandlerFunction() === 'runDailySnapshot')
+    .forEach(t => ScriptApp.deleteTrigger(t));
+}
